@@ -1,0 +1,3 @@
+/app/lynx/build/CMakeFiles/lynx.dir
+/app/lynx/build/CMakeFiles/edit_cache.dir
+/app/lynx/build/CMakeFiles/rebuild_cache.dir
