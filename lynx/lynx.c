@@ -153,9 +153,9 @@ static void suzy_run_sprites(Lynx* l) {
                     if (vaddr >= 0xFC00) continue;
                     uint8_t cur = l->ram[vaddr];
                     if (x & 1)
-                        l->ram[vaddr] = (cur & 0xF0) | (color & 0x0F);
-                    else
                         l->ram[vaddr] = (cur & 0x0F) | ((color & 0x0F) << 4);
+                    else
+                        l->ram[vaddr] = (cur & 0xF0) | (color & 0x0F);
                 }
             }
             (void)type; (void)sprcoll; (void)bpp;
@@ -387,8 +387,8 @@ static void mikey_render_line(Lynx* l, int line) {
     for (int x = 0; x < LYNX_SCREEN_W; x += 2) {
         uint16_t addr = (uint16_t)(base + (x >> 1));
         uint8_t b = (addr < 0xFC00) ? l->ram[addr] : 0;
-        uint8_t hi = (b >> 4) & 0x0F;
-        uint8_t lo = b & 0x0F;
+        uint8_t lo = (b >> 4) & 0x0F;
+        uint8_t hi = b & 0x0F;
         dst[x]     = l->mikey.palette_argb[hi];
         dst[x + 1] = l->mikey.palette_argb[lo];
     }
