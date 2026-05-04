@@ -126,6 +126,10 @@ static void suzy_run_sprites(Lynx* l) {
             if (width > 64)  width  = 64;
             if (height > 64) height = 64;
 
+            // VIDBAS from Suzy registers $FC08/$FC09
+            uint16_t vidbas = (uint16_t)s->regs[0x08] | ((uint16_t)s->regs[0x09] << 8);
+            if (vidbas == 0 || vidbas >= 0xFC00) vidbas = l->mikey.disp_addr;
+
             for (int dy = 0; dy < height; dy++) {
                 int y = ypos + dy;
                 if (y < 0 || y >= LYNX_SCREEN_H) continue;
@@ -142,8 +146,10 @@ static void suzy_run_sprites(Lynx* l) {
                     uint8_t mask = (uint8_t)((1 << bpp) - 1);
                     uint8_t color = (uint8_t)((b >> (8 - bpp - bit)) & mask);
 
-                    // Pintar en la RAM de vídeo en disp_addr
-                    uint16_t vaddr = l->mikey.disp_addr + (uint16_t)(y * (LYNX_SCREEN_W / 2) + (x >> 1));
+                    if (color == 0) continue; // transparent
+
+                    // Pintar en la RAM de vídeo en vidbas (Suzy destination)
+                    uint16_t vaddr = vidbas + (uint16_t)(y * (LYNX_SCREEN_W / 2) + (x >> 1));
                     if (vaddr >= 0xFC00) continue;
                     uint8_t cur = l->ram[vaddr];
                     if (x & 1)
@@ -152,7 +158,7 @@ static void suzy_run_sprites(Lynx* l) {
                         l->ram[vaddr] = (cur & 0x0F) | ((color & 0x0F) << 4);
                 }
             }
-            (void)type; (void)sprcoll; (void)bpp; // se podrían usar para extender
+            (void)type; (void)sprcoll; (void)bpp;
             s->sprites_drawn++;
         }
 
@@ -172,6 +178,34 @@ static uint8_t suzy_read(Lynx* l, uint8_t reg) {
     case 0x91: return (uint8_t)((s->busy ? 0x01 : 0x00) | s->regs[0x91]);
     case 0x92: return l->joypad ^ 0xFF; // JOYSTICK (active high in Lynx?)
     case 0x93: return l->switches;
+    case 0xB2: { // RCART0 — read cartridge bank 0
+        if (l->cart.data && l->cart.size > 0) {
+            uint32_t addr = ((uint32_t)l->cart.shift_reg << l->cart.shift_count)
+                          + (l->cart.counter & l->cart.counter_mask);
+            addr %= l->cart.size;
+            uint8_t byte = l->cart.data[addr];
+            if (!l->cart.strobe) {
+                l->cart.counter++;
+                l->cart.counter &= 0x7FF;
+            }
+            return byte;
+        }
+        return 0xFF;
+    }
+    case 0xB3: { // RCART1 — read cartridge bank 1
+        if (l->cart.data && l->cart.size > 0) {
+            uint32_t addr = ((uint32_t)l->cart.shift_reg << l->cart.shift_count)
+                          + (l->cart.counter & l->cart.counter_mask);
+            addr %= l->cart.size;
+            uint8_t byte = l->cart.data[addr];
+            if (!l->cart.strobe) {
+                l->cart.counter++;
+                l->cart.counter &= 0x7FF;
+            }
+            return byte;
+        }
+        return 0xFF;
+    }
     default: return s->regs[reg];
     }
 }
@@ -270,6 +304,7 @@ static uint8_t mikey_read(Lynx* l, uint8_t reg) {
 
 static void mikey_write(Lynx* l, uint8_t reg, uint8_t val) {
     Mikey* m = &l->mikey;
+    uint8_t prev_val = m->regs[reg];
     m->regs[reg] = val;
 
     if (reg < 0x20) {
@@ -319,21 +354,23 @@ static void mikey_write(Lynx* l, uint8_t reg, uint8_t val) {
     case 0x8B: l->iodir = val; break;
     case 0x8A: {
         l->iodat = val;
-        // Strobes del cartucho:
-        // bit1 (CART_ADDR_DATA): pulso para cargar dirección bit a bit
-        // bit0 (CART_ADDR_STROBE): cuando va a 1, resetea contador
-        if (val & 0x02) {
-            // strobe address
-            l->cart.cur_addr = ((l->cart.cur_addr << 1) | ((val & 0x01) ? 1 : 0)) & 0x1FFFFF;
-        }
-        if (val & 0x04) {
-            // signal AUDIN — bit usado por algunos juegos
-        }
         break;
     }
     case 0x92: m->disp_ctl = val; break;
     case 0x94: m->disp_addr = (uint16_t)((m->disp_addr & 0xFF00) | val); break;
     case 0x95: m->disp_addr = (uint16_t)((m->disp_addr & 0x00FF) | ((uint16_t)val << 8)); break;
+    case 0x87: { // SYSCTL1 — cart address strobe
+        uint8_t prev = prev_val;
+        l->cart.strobe = val & 0x01;
+        if (l->cart.strobe) l->cart.counter = 0;
+        // Rising edge of bit 0: clock one address bit into shift register
+        if ((val & 0x01) && !(prev & 0x01)) {
+            uint8_t addr_bit = (l->iodir >> 1) & 1;
+            l->cart.shift_reg = (uint8_t)((l->cart.shift_reg << 1) | addr_bit);
+            l->cart.shift_reg &= 0xFF;
+        }
+        break;
+    }
     case 0x8C: // SERCTL
     case 0x8D: // SERDAT
         break;
@@ -356,40 +393,50 @@ static void mikey_render_line(Lynx* l, int line) {
     }
 }
 
-// Avance de timers Mikey por elapsed ciclos de CPU
+// Avance de timers Mikey por elapsed ciclos de CPU.
+// Linking chain: timer 0→2→4→6,  timer 1→3→5→7
 static void mikey_step(Lynx* l, int elapsed) {
     Mikey* m = &l->mikey;
+    bool borrow[MIKEY_NUM_TIMERS];
+    memset(borrow, 0, sizeof(borrow));
+
     for (int i = 0; i < MIKEY_NUM_TIMERS; i++) {
         MikeyTimer* t = &m->timer[i];
         if (!(t->control_a & 0x08)) continue;        // ENABLE_COUNT
         uint8_t src = t->control_a & 0x07;
-        if (src == 7) continue;                       // linking — simplificado
-        uint32_t base = mikey_clock_table[src];
-        if (base == 0) continue;
-        // Ticks que pasarían en este intervalo
-        t->divider_acc += (int32_t)elapsed;
-        int32_t cyc_per_tick = (int32_t)(LYNX_CPU_FREQ / base);
-        if (cyc_per_tick <= 0) cyc_per_tick = 1;
-        while (t->divider_acc >= cyc_per_tick) {
-            t->divider_acc -= cyc_per_tick;
+        int ticks = 0;
+
+        if (src == 7) {
+            // Linked timer: clocked by borrow-out of timer i-2
+            if (i >= 2 && borrow[i - 2]) ticks = 1;
+        } else {
+            uint32_t hz = mikey_clock_table[src];
+            if (hz == 0) continue;
+            t->divider_acc += (int32_t)elapsed;
+            int32_t cyc_per_tick = (int32_t)(LYNX_CPU_FREQ / hz);
+            if (cyc_per_tick <= 0) cyc_per_tick = 1;
+            while (t->divider_acc >= cyc_per_tick) {
+                t->divider_acc -= cyc_per_tick;
+                ticks++;
+            }
+        }
+
+        for (int k = 0; k < ticks; k++) {
             if (t->count == 0) {
-                // Underflow: timer 0 = HSYNC, timer 2 = VSYNC, timer 4 = serial, 7 = audio link…
+                borrow[i] = true;
                 t->control_b |= 0x08;        // BORROW_OUT
-                if (t->control_a & 0x10) {   // RELOAD
+                if (t->control_a & 0x10)      // RELOAD
                     t->count = t->backup;
-                } else {
-                    t->control_a &= ~0x08;   // stop
-                }
-                if (t->control_a & 0x80) {   // ENABLE_INT
+                else
+                    t->control_a &= ~0x08;    // stop
+                if (t->control_a & 0x80)      // ENABLE_INT
                     m->irq_status |= (uint8_t)(1u << i);
-                }
-                // HSYNC (timer 0) — render current line then advance
+                // HSYNC (timer 0) — render scanline
                 if (i == 0) {
                     mikey_render_line(l, m->current_line);
                     m->current_line++;
-                    if (m->current_line >= LYNX_LINES_PER_FRAME) {
+                    if (m->current_line >= LYNX_LINES_PER_FRAME)
                         m->current_line = 0;
-                    }
                 }
             } else {
                 t->count--;
@@ -590,21 +637,28 @@ int lynx_load_cart(Lynx* l, const char* path) {
                l->cart.title, l->cart.manufacturer, data_sz,
                l->cart.bank0_size, l->cart.bank1_size);
     } else {
-        // Raw .o
+        // Raw .o — compute page size from total size (like Handy)
         l->cart.data = buf;
         l->cart.size = (uint32_t)sz;
-        l->cart.bank0_size = 256;
+        l->cart.bank0_size = (uint16_t)(sz >> 8);
         buf = NULL;
         printf("Lynx: cartucho RAW cargado: %u bytes\n", l->cart.size);
     }
     if (buf) free(buf);
 
-    // Volcar primer banco al inicio de la RAM ($0000) tal como hace el BIOS al
-    // arrancar (esquema simplificado: BIOS Lynx normalmente decodifica el cart
-    // mediante IODAT/IODIR, aquí lo simulamos copiando el banco 0).
-    uint32_t copy = l->cart.size;
-    if (copy > 0xFC00) copy = 0xFC00;
-    memcpy(l->ram, l->cart.data, copy);
+    // Compute shift_count and counter_mask from bank0 page_size
+    {
+        uint16_t ps = l->cart.bank0_size;
+        if      (ps <= 0x100) { l->cart.shift_count = 8;  l->cart.counter_mask = 0x0FF; }
+        else if (ps <= 0x200) { l->cart.shift_count = 9;  l->cart.counter_mask = 0x1FF; }
+        else if (ps <= 0x400) { l->cart.shift_count = 10; l->cart.counter_mask = 0x3FF; }
+        else                  { l->cart.shift_count = 11; l->cart.counter_mask = 0x7FF; }
+        printf("Lynx: cart shift_count=%d counter_mask=%03X\n",
+               l->cart.shift_count, l->cart.counter_mask);
+    }
+    l->cart.counter = 0;
+    l->cart.strobe = 0;
+    l->cart.shift_reg = 0;
     l->cart.loaded = true;
 
     return 0;
@@ -684,6 +738,8 @@ void lynx_run_frame(Lynx* l) {
     l->audio_pos = 0;
     l->mikey.current_line = 0;
 
+
+
     while (cycles_done < LYNX_CYCLES_PER_FRAME) {
         unsigned long cyc_before = l->cpu.cyc;
         m6502_step(&l->cpu);
@@ -712,6 +768,8 @@ void lynx_run_frame(Lynx* l) {
     if (l->mikey.current_line == 0) {
         for (int y = 0; y < LYNX_SCREEN_H; y++) mikey_render_line(l, y);
     }
+
+
 
     if (l->audio_dev > 0 && l->audio_pos > 0 && !l->turbo_mode) {
         SDL_QueueAudio(l->audio_dev, l->audio_buffer,

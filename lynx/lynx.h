@@ -138,10 +138,12 @@ typedef struct {
     char     manufacturer[17];
     bool     loaded;
 
-    // Acceso por strobes IODAT
-    uint8_t  shift_reg;      // 8-bit shift cargado por addr strobe
-    uint32_t cur_addr;       // dirección dentro del banco
-    uint8_t  cur_bank;       // 0 ó 1
+    // Acceso por strobes — modela shifter + counter como en hardware real
+    uint8_t  shift_reg;      // 8-bit shift register (upper address bits)
+    uint32_t counter;        // auto-increment counter (lower address bits)
+    uint8_t  strobe;         // current SYSCTL1 bit 0 state
+    uint8_t  shift_count;    // bits to shift: 8(64K), 9(128K), 10(256K), 11(512K)
+    uint32_t counter_mask;   // counter wrap mask: 0xFF, 0x1FF, 0x3FF, 0x7FF
 } LynxCart;
 
 // ---------------------------------------------------------------------------
