@@ -366,7 +366,7 @@ static void mikey_write(Lynx* l, uint8_t reg, uint8_t val) {
         if (l->cart.strobe) l->cart.counter = 0;
         // Rising edge of bit 0: clock one address bit into shift register
         if ((val & 0x01) && !(prev & 0x01)) {
-            uint8_t addr_bit = (l->iodat >> 1) & 1;
+            uint8_t addr_bit = l->iodat & 0x01;
             l->cart.shift_reg = (uint8_t)((l->cart.shift_reg << 1) | addr_bit);
             l->cart.shift_reg &= 0xFF;
         }
