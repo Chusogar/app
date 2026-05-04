@@ -194,7 +194,8 @@ static uint8_t suzy_read(Lynx* l, uint8_t reg) {
     }
     case 0xB3: { // RCART1 — read cartridge bank 1
         if (l->cart.data && l->cart.size > 0) {
-            uint32_t addr = ((uint32_t)l->cart.shift_reg << l->cart.shift_count)
+            uint32_t bank0_bytes = (uint32_t)l->cart.bank0_size * 256;
+            uint32_t addr = bank0_bytes + ((uint32_t)l->cart.shift_reg << l->cart.shift_count)
                           + (l->cart.counter & l->cart.counter_mask);
             addr %= l->cart.size;
             uint8_t byte = l->cart.data[addr];
@@ -659,6 +660,14 @@ int lynx_load_cart(Lynx* l, const char* path) {
     l->cart.counter = 0;
     l->cart.strobe = 0;
     l->cart.shift_reg = 0;
+
+    // Fallback: copy cart to RAM for BIOS-less boot
+    if (!l->rom_loaded) {
+        uint32_t copy = l->cart.size;
+        if (copy > 0xFC00) copy = 0xFC00;
+        memcpy(l->ram, l->cart.data, copy);
+    }
+
     l->cart.loaded = true;
 
     return 0;
